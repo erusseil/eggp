@@ -57,9 +57,9 @@ def main(args: List[str] = []) -> int:
     with hs_rts_init(args):
         return unsafe_hs_eggp_main()
 
-def eggp_run(dataset: str, gen: int, nPop: int, maxSize: int, nTournament: int, pc: float, pm: float, nonterminals: str, loss: str, optIter: int, optRepeat: int, nParams: int, split: int, max_time : int, simplify: int, trace : int, generational : int, dumpTo: str, loadFrom: str, varnames : str, useFracBayes: int) -> str:
+def eggp_run(dataset: str, gen: int, nPop: int, maxSize: int, nTournament: int, pc: float, pm: float, nonterminals: str, loss: str, optIter: int, optRepeat: int, nParams: int, split: int, max_time : int, simplify: int, trace : int, generational : int, dumpTo: str, loadFrom: str, varnames : str, class_labels : str, prior_features : str, useFracBayes: int) -> str:
     with hs_rts_init():
-        return unsafe_hs_eggp_run(dataset, gen, nPop, maxSize, nTournament, pc, pm, nonterminals, loss, optIter, optRepeat, nParams, split, max_time, simplify, trace, generational, dumpTo, loadFrom, varnames, useFracBayes)
+        return unsafe_hs_eggp_run(dataset, gen, nPop, maxSize, nTournament, pc, pm, nonterminals, loss, optIter, optRepeat, nParams, split, max_time, simplify, trace, generational, dumpTo, loadFrom, varnames, class_labels, prior_features, useFracBayes)
 
 def make_function(expression, loss="MSE"):
     def func(x, t):
@@ -287,6 +287,20 @@ class EGGP(BaseEstimator, RegressorMixin):
         else:
             return dname
 
+    _AGGREGATOR_TOKENS = {"avg", "std", "median", "max", "min", "ptp"}
+
+    def _check_aggregator_usage(self):
+        ''' Aggregators require nParams=0 (see checkAggregatorUsage in
+        Search.hs); failing fast here avoids spawning the Haskell runtime. '''
+        tokens = {t.strip().lower() for t in self.nonterminals.split(",")}
+        if tokens & self._AGGREGATOR_TOKENS and self.nParams != 0:
+            raise ValueError(
+                f"Aggregator non-terminals ({', '.join(sorted(tokens & self._AGGREGATOR_TOKENS))}) "
+                f"require nParams=0 (Const-only search) -- got nParams={self.nParams}. "
+                "They reduce their whole input vector and are only well-defined "
+                "for a search that never fits a Param."
+            )
+
     def fit(self, X, y, Xerr = None, yerr = None):
         ''' Fits the regression model.
 
@@ -304,6 +318,7 @@ class EGGP(BaseEstimator, RegressorMixin):
         A table with the fitted models and additional information
         will be stored as a Pandas dataframe in self.results.
         '''
+        self._check_aggregator_usage()
         combined = self.combine_dataset(X, y, Xerr, yerr)
         header = self.get_header(X.shape[1])
         if isinstance(X, pd.DataFrame):
@@ -319,7 +334,7 @@ class EGGP(BaseEstimator, RegressorMixin):
         dname = self.get_fname(dataset, header)
 
         try:
-            csv_data = eggp_run(dname, self.gen, self.nPop, self.maxSize, self.nTournament, self.pc, self.pm, self.nonterminals, self.loss, self.optIter, self.optRepeat, self.nParams, self.folds, self.max_time, self.simplify, self.trace, self.generational, self.dumpTo, self.loadFrom, varnames, self.useFracBayes)
+            csv_data = eggp_run(dname, self.gen, self.nPop, self.maxSize, self.nTournament, self.pc, self.pm, self.nonterminals, self.loss, self.optIter, self.optRepeat, self.nParams, self.folds, self.max_time, self.simplify, self.trace, self.generational, self.dumpTo, self.loadFrom, varnames, "", "", self.useFracBayes)
 
         finally:
             os.remove(dataset)
@@ -330,7 +345,7 @@ class EGGP(BaseEstimator, RegressorMixin):
             self.is_fitted_ = True
         return self
 
-    def fit_mvsr(self, Xs, ys, Xerrs = None, yerrs = None):
+    def fit_mvsr(self, Xs, ys, Xerrs = None, yerrs = None, class_labels = None, prior_features = None):
         ''' Fits a multi-view regression model.
 
         Parameters
@@ -339,11 +354,33 @@ class EGGP(BaseEstimator, RegressorMixin):
             A list with k elements of m_k x n np.arrays describing m_k observations of n features.
         ys : list(np.array)
             A list of k elements of np.arrays of size m_k with the measured target values.
+        class_labels : list(str), default=None
+            A list of k class labels, one per view. If given, switches the search
+            to Tier 2 classifier-driven fitness: `ys` is not used as a regression
+            target, and the fitness instead scores how well a reduced pointwise
+            transform of each view's data separates the given classes.
+        prior_features : list(list(float)), default=None
+            One list per view of already locked-in scalar feature values from
+            previous rounds of sequential/boosting-style feature discovery.
+            Only meaningful together with `class_labels`: the search is then
+            scored by how well
+            [prior_features[view] + [this round's reduced scalar]] jointly
+            separates the classes, instead of the new scalar alone -- so each
+            new feature is optimized to compensate for what the earlier ones
+            still miss. `None` (default) or a list of empty lists reproduces
+            a standalone single-feature search.
         '''
+        self._check_aggregator_usage()
         if Xerrs is None:
             Xerrs = [None for _ in Xs]
         if yerrs is None:
             yerrs = [None for _ in ys]
+        if class_labels is not None and len(class_labels) != len(Xs):
+            raise ValueError('class_labels must have one label per view (same length as Xs)')
+        if prior_features is not None and len(prior_features) != len(Xs):
+            raise ValueError('prior_features must have one list per view (same length as Xs)')
+        class_labels_str = ",".join(map(str, class_labels)) if class_labels is not None else ""
+        prior_features_str = ";".join(",".join(map(str, feats)) for feats in prior_features) if prior_features is not None else ""
 
         combineds = [self.combine_dataset(X, y, Xerr, yerr) for X, y, Xerr, yerr in zip(Xs, ys, Xerrs, yerrs)]
         header = self.get_header(Xs[0].shape[1])
@@ -364,7 +401,7 @@ class EGGP(BaseEstimator, RegressorMixin):
 
         try:
             csv_data = eggp_run(" ".join(datasets), self.gen, self.nPop, self.maxSize, self.nTournament, self.pc, self.pm,
-                                self.nonterminals, self.loss, self.optIter, self.optRepeat, self.nParams, self.folds, self.max_time, self.simplify, self.trace, self.generational, self.dumpTo, self.loadFrom, varnames, self.useFracBayes)
+                                self.nonterminals, self.loss, self.optIter, self.optRepeat, self.nParams, self.folds, self.max_time, self.simplify, self.trace, self.generational, self.dumpTo, self.loadFrom, varnames, class_labels_str, prior_features_str, self.useFracBayes)
         finally:
             for dataset in datasetsNames:
                 os.remove(dataset)

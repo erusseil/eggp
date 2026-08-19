@@ -14,6 +14,7 @@ import Algorithm.EqSat.Queries
 import Algorithm.EqSat.Info
 import Algorithm.EqSat.DB
 import Algorithm.SRTree.Likelihoods
+import Algorithm.SRTree.ClassifierFitness ( scoreAllReductions )
 import Algorithm.SRTree.ModelSelection
 import Algorithm.SRTree.Opt
 import Control.Lens (element, makeLenses, over, (&), (+~), (-~), (.~), (^.))
@@ -42,6 +43,7 @@ import Algorithm.SRTree.NonlinearOpt
 import Data.Binary ( encode, decode )
 import qualified Data.ByteString.Lazy as BS
 import Data.List.Split (splitOn)
+import Data.Char (toLower)
 
 import Algorithm.EqSat (runEqSat,applySingleMergeOnlyEqSat)
 
@@ -87,12 +89,44 @@ data Args = Args
     _simplify     :: Bool,
     _maxtime      :: Int,
     _varnames     :: String,
+    _classLabels  :: String,
+    _priorFeatures :: String,
     _useFracBayes :: Bool
   }
   deriving (Show)
 
 csvHeader :: String
-csvHeader = "id,view,Expression,Numpy,Math,theta,size,loss_train,loss_val,loss_test,maxloss,R2_train,R2_val,R2_test,dl_train,dl_val,dl_test"
+csvHeader = "id,view,Expression,Numpy,Math,theta,size,loss_train,loss_val,loss_test,maxloss,R2_train,R2_val,R2_test,dl_train,dl_val,dl_test,reduction,class_scalar"
+
+-- | Aggregator non-terminals (the `Agg AggFunc val` constructor) reduce
+-- their whole input vector and are only evaluated correctly through
+-- `evalTree`'s whole-array path, not the AD/gradient machinery, so they
+-- require a Param-free (nParams=0) search.
+aggregatorTokens :: [String]
+aggregatorTokens = ["avg", "std", "median", "max", "min", "ptp"]
+
+checkAggregatorUsage :: Args -> IO ()
+checkAggregatorUsage args =
+  when (usesAggregator && _nParams args /= 0) $
+    error $ "Aggregator non-terminals (avg/std/median/max/min/ptp) require nParams=0 "
+         <> "(Const-only search) -- got nParams=" <> show (_nParams args) <> ". "
+         <> "They reduce their whole input vector and are only well-defined "
+         <> "for a search that never fits a Param."
+  where
+    tokens = Prelude.map (Prelude.map toLower) (splitOn "," (_nonterminals args))
+    usesAggregator = Prelude.any (`Prelude.elem` aggregatorTokens) tokens
+
+-- | Parse the semicolon-separated (per view) / comma-separated (per feature)
+-- `--prior-features` string into one list of already locked-in scalar
+-- features per view, for sequential feature discovery. Empty string (the
+-- default) means no prior features for any view, i.e. a plain single-feature
+-- search.
+parsePriorFeatures :: Int -> String -> [[Double]]
+parsePriorFeatures nViews s
+  | null s    = Prelude.replicate nViews []
+  | otherwise = Prelude.map parseView (splitOn ";" s)
+  where
+    parseView v = if null v then [] else Prelude.map Prelude.read (splitOn "," v)
 
 egraphGP :: [(DataSet, DataSet)] -> [DataSet] -> Args -> StateT EGraph (StateT StdGen IO) String
 egraphGP dataTrainVals dataTests args = do
@@ -150,7 +184,11 @@ egraphGP dataTrainVals dataTests args = do
   where
     maxSize = (_maxSize args)
     maxMem = 2000000 -- running 1 iter of eqsat for each new individual will consume ~3GB
-    fitFun = fitnessMV shouldReparam (_optRepeat args) (_optIter args) (_distribution args) dataTrainVals
+    classLabels = _classLabels args
+    priorFeatures = parsePriorFeatures (length dataTrainVals) (_priorFeatures args)
+    fitFun = if null classLabels
+                then fitnessMV shouldReparam (_optRepeat args) (_optIter args) (_distribution args) dataTrainVals
+                else classifierFitness (splitOn "," classLabels) priorFeatures dataTrainVals
     nonTerms   = parseNonTerms (_nonterminals args)
     (Sz2 _ nFeats) = MA.size (getX .fst . head $ dataTrainVals)
     params         = if _nParams args == -1 then [param 0] else Prelude.map param [0 .. _nParams args - 1]
@@ -161,10 +199,17 @@ egraphGP dataTrainVals dataTests args = do
                           else [var ix | ix <- [0 .. nFeats-1]] -- <> params
     uniNonTerms = [t | t <- nonTerms, isUni t]
     binNonTerms = [t | t <- nonTerms, isBin t]
+    aggNonTerms = [t | t <- nonTerms, isAgg t]
+    -- arity-1 slots can be filled by either a Uni or an Agg token (both take
+    -- exactly one child) -- used where mutation repair needs "any arity-1
+    -- replacement", not specifically a pointwise one.
+    arity1NonTerms = uniNonTerms <> aggNonTerms
     isUni (Uni _ _)   = True
     isUni _           = False
     isBin (Bin _ _ _) = True
     isBin _           = False
+    isAgg (Agg _ _)   = True
+    isAgg _           = False
 
     sortedDLs = pickEvenly (_nPop args) $ sort [fromIntegral x * log (fromIntegral y) | x <- [2 .. _maxSize args], y <- [2 .. x]]
 
@@ -269,6 +314,8 @@ egraphGP dataTrainVals dataTests args = do
         Var   ix -> pure . Fix $ Var ix
         Uni f t' -> do t <- canonical t'
                        (Fix . Uni f) <$> getSubtree (pos-1) (sz+1) (Just $ Uni f) (parent:mGrandParents) cands t
+        Agg f t' -> do t <- canonical t'
+                       (Fix . Agg f) <$> getSubtree (pos-1) (sz+1) (Just $ Agg f) (parent:mGrandParents) cands t
         Bin op l'' r'' ->
                       do l <- canonical l''
                          r <- canonical r''
@@ -290,6 +337,7 @@ egraphGP dataTrainVals dataTests args = do
                         rs <- getAllSubClasses r
                         pure (p : (ls <> rs))
         Uni _ t   -> (p:) <$> getAllSubClasses t
+        Agg _ t   -> (p:) <$> getAllSubClasses t
         _         -> pure [p]
 
     mutate p = do sz <- getSize p
@@ -303,6 +351,7 @@ egraphGP dataTrainVals dataTests args = do
     peel :: Fix SRTree -> SRTree ()
     peel (Fix (Bin op l r)) = Bin op () ()
     peel (Fix (Uni f t)) = Uni f ()
+    peel (Fix (Agg f t)) = Agg f ()
     peel (Fix (Param ix)) = Param ix
     peel (Fix (Var ix)) = Var ix
     peel (Fix (Const x)) = Const x
@@ -320,7 +369,7 @@ egraphGP dataTrainVals dataTests args = do
          then do let children = childrenOf root
                  candidates <- case length children of
                                 0  -> filterM (checkToken parent . (replaceChildren children)) (Prelude.map peel terms)
-                                1 -> filterM (checkToken parent . (replaceChildren children)) uniNonTerms
+                                1 -> filterM (checkToken parent . (replaceChildren children)) arity1NonTerms
                                 2 -> filterM (checkToken parent . (replaceChildren children)) binNonTerms
                  if null candidates
                      then pure $ Fix tree -- there's no candidate, so we failed and admit defeat
@@ -337,6 +386,7 @@ egraphGP dataTrainVals dataTests args = do
           Const x  -> pure . Fix $ Const x
           Var   ix -> pure . Fix $ Var ix
           Uni f t'  -> canonical t' >>= \t -> (Fix . Uni f) <$> mutAt (pos-1) (sizeLeft-1) (Just $ Uni f) t
+          Agg f t'  -> canonical t' >>= \t -> (Fix . Agg f) <$> mutAt (pos-1) (sizeLeft-1) (Just $ Agg f) t
           Bin op ln rn -> do l <- canonical ln
                              r <- canonical rn
                              szLft <- getSize l
@@ -363,7 +413,14 @@ egraphGP dataTrainVals dataTests args = do
                         then fitFun best'
                         else pure (1.0, thetas')
 
-        maxLoss <- negate . fromJust <$> getFitness ec
+        -- classifier-mode fitness is a score (higher = better separability),
+        -- not a loss, so it's reported as-is instead of negated.
+        maxLoss <- (if null classLabels then negate else id) . fromJust <$> getFitness ec
+        let (reductionName, classScalarStrs) =
+              if null classLabels
+                 then ("", Prelude.replicate (length dataTrainVals) "")
+                 else let (name, scalars, _) = scoreAllReductions (Prelude.map fst dataTrainVals) (splitOn "," classLabels) priorFeatures best'
+                      in (name, Prelude.map show scalars)
         ts <- forM (Data.List.zip4 [0..] dataTrainVals dataTests thetas) $ \(view, (dataTrain, dataVal), dataTest, theta) -> do
             let (x, y, mYErr) = dataTrain
                 (x_val, y_val, mYErr_val) = dataVal
@@ -372,15 +429,15 @@ egraphGP dataTrainVals dataTests args = do
 
                 expr      = paramsToConst (MA.toList theta) best'
                 showNA z  = if isNaN z then "" else show z
-                r2_train  = r2 x y best' theta
-                r2_val    = r2 x_val y_val best' theta
-                r2_te     = r2 x_te y_te best' theta
-                nll_train  = nll distribution mYErr x y best' theta
-                nll_val    = nll distribution mYErr_val x_val y_val best' theta
-                nll_te     = nll distribution mYErr_te x_te y_te best' theta
-                mdl_train  = fractionalBayesFactor distribution mYErr x y theta best'
-                mdl_val    = fractionalBayesFactor distribution mYErr_val x_val y_val theta best'
-                mdl_te     = fractionalBayesFactor distribution mYErr_te x_te y_te theta best'
+                -- classifier mode has no regression target; these diagnostics
+                -- would crash on empty theta (nParams=0), so left blank.
+                (r2_train, r2_val, r2_te, nll_train, nll_val, nll_te, mdl_train, mdl_val, mdl_te) =
+                  if null classLabels
+                     then ( r2 x y best' theta, r2 x_val y_val best' theta, r2 x_te y_te best' theta
+                          , nll distribution mYErr x y best' theta, nll distribution mYErr_val x_val y_val best' theta, nll distribution mYErr_te x_te y_te best' theta
+                          , fractionalBayesFactor distribution mYErr x y theta best', fractionalBayesFactor distribution mYErr_val x_val y_val theta best', fractionalBayesFactor distribution mYErr_te x_te y_te theta best'
+                          )
+                     else (0/0, 0/0, 0/0, 0/0, 0/0, 0/0, 0/0, 0/0, 0/0)
                 vals       = intercalate ","
                            $ Prelude.map showNA [ nll_train, nll_val, nll_te, maxLoss
                                                 , r2_train, r2_val, r2_te
@@ -393,6 +450,7 @@ egraphGP dataTrainVals dataTests args = do
                            <> "\"$$" <> showLatexFun best' <> "$$\","
                            <> thetaStr <> "," <> show (countNodes $ convertProtectedOps expr)
                            <> "," <> vals
+                           <> "," <> reductionName <> "," <> (classScalarStrs Prelude.!! view)
         pure ts
 
     insertTerms =
